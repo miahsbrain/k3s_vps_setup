@@ -1,0 +1,244 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: houston-web
+  namespace: ${NAMESPACE}
+  labels: { app: houston-web }
+spec:
+  replicas: ${REPLICAS}
+  revisionHistoryLimit: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+  selector:
+    matchLabels: { app: houston-web }
+  template:
+    metadata:
+      labels: { app: houston-web }
+    spec:
+      terminationGracePeriodSeconds: 30
+      imagePullSecrets:
+        - name: regcred
+      securityContext:
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+
+      containers:
+        - name: app
+          image: ${IMAGE_REF}
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: LOCAL_PORT
+              value: "${APP_PORT}"
+            - name: SITE_ROOT
+              value: /srv/www
+            - name: TMPDIR
+              value: /var/lib/houston
+            - name: FRONTEND_URL
+              value: "https://${APP_HOST}"
+            - name: CORS_ORIGINS
+              value: "https://${APP_HOST}"
+            - name: TZ
+              value: "America/Chicago"
+          envFrom:
+            - secretRef:
+                name: app-env
+          volumeMounts:
+            - name: media
+              mountPath: /var/lib/houston
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            timeoutSeconds: 3
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { cpu: "1", memory: 768Mi }
+          securityContext:
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
+
+      volumes:
+        - name: media
+          persistentVolumeClaim:
+            claimName: houston-media
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: houston-web
+  namespace: ${NAMESPACE}
+  labels: { app: houston-web }
+spec:
+  selector: { app: houston-web }
+  ports:
+    - name: http
+      port: 80
+      targetPort: 3000
+
+---
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: houston-media
+  namespace: ${NAMESPACE}
+  labels: { app: houston-web }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: houston-web
+  namespace: ${NAMESPACE}
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+    acme.cert-manager.io/http01-edit-in-place: "true"
+    ingress.kubernetes.io/ssl-redirect: "${SSL_REDIRECT}"
+    nginx.org/client-max-body-size: "12m"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts: ["${APP_HOST}", "${WWW_HOST}"]
+      secretName: houston-web-tls
+  rules:
+    - host: "${APP_HOST}"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: houston-web
+                port: { number: 80 }
+                
+    - host: "${WWW_HOST}"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: houston-web
+                port:
+                  number: 80
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: houston-offers
+  namespace: ${NAMESPACE}
+  labels: { app: houston-jobs }
+spec:
+  schedule: "*/10 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 900
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels: { app: houston-jobs, job: offers }
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: regcred
+          securityContext:
+            fsGroup: 1000
+            fsGroupChangePolicy: OnRootMismatch
+          containers:
+            - name: run
+              image: ${IMAGE_REF}
+              imagePullPolicy: IfNotPresent
+              command: ["node", "scripts/run-scheduled.mjs", "offers"]
+              env:
+                - { name: TMPDIR, value: /var/lib/houston }
+                - { name: FRONTEND_URL, value: "https://${APP_HOST}" }
+                - { name: TZ, value: America/Chicago }
+              envFrom:
+                - secretRef:
+                    name: app-env
+              volumeMounts:
+                - { name: media, mountPath: /var/lib/houston }
+              resources:
+                requests: { cpu: 100m, memory: 256Mi }
+                limits: { cpu: "1", memory: 768Mi }
+              securityContext:
+                runAsUser: 1000
+                runAsGroup: 1000
+                allowPrivilegeEscalation: false
+          volumes:
+            - name: media
+              persistentVolumeClaim:
+                claimName: houston-media
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: houston-reminders
+  namespace: ${NAMESPACE}
+  labels: { app: houston-jobs }
+spec:
+  schedule: "0 * * * *"
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: 120
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 900
+      ttlSecondsAfterFinished: 86400
+      template:
+        metadata:
+          labels: { app: houston-jobs, job: reminders }
+        spec:
+          restartPolicy: Never
+          imagePullSecrets:
+            - name: regcred
+          securityContext:
+            fsGroup: 1000
+            fsGroupChangePolicy: OnRootMismatch
+          containers:
+            - name: run
+              image: ${IMAGE_REF}
+              imagePullPolicy: IfNotPresent
+              command: ["node", "scripts/run-scheduled.mjs", "reminders"]
+              env:
+                - { name: TMPDIR, value: /var/lib/houston }
+                - { name: FRONTEND_URL, value: "https://${APP_HOST}" }
+                - { name: TZ, value: America/Chicago }
+              envFrom:
+                - secretRef:
+                    name: app-env
+              volumeMounts:
+                - { name: media, mountPath: /var/lib/houston }
+              resources:
+                requests: { cpu: 100m, memory: 256Mi }
+                limits: { cpu: "1", memory: 768Mi }
+              securityContext:
+                runAsUser: 1000
+                runAsGroup: 1000
+                allowPrivilegeEscalation: false
+          volumes:
+            - name: media
+              persistentVolumeClaim:
+                claimName: houston-media

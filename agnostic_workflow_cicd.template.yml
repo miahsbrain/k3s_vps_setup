@@ -1,0 +1,99 @@
+name: Build and deploy
+
+on:
+  push:
+    branches: [dev, main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  APP_PORT: "3000" # keep 3000: deploy/nginx.conf proxies to 127.0.0.1:3000
+  IMAGE_NAME: houston-web
+  SUFFIX: ${{ github.ref_name == 'main' && 'PRODUCTION' || 'STAGING' }}
+  ENV_NAME: ${{ github.ref_name == 'main' && 'production' || 'staging' }}
+  NAMESPACE: ${{ github.ref_name == 'main' && 'houston-production' || 'houston-staging' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.REGISTRY_HOST || vars.REGISTRY_HOST }}
+          username: ${{ secrets.REGISTRY_USER }}
+          password: ${{ secrets.REGISTRY_PASS }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ${{ secrets.REGISTRY_HOST || vars.REGISTRY_HOST }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ secrets.REGISTRY_HOST || vars.REGISTRY_HOST }}/${{ env.IMAGE_NAME }}:${{ env.ENV_NAME }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST || vars.SSH_HOST }}
+          SSH_KEY: ${{ secrets[format('DEPLOY_SSH_KEY_{0}', env.SUFFIX)] || vars[format('DEPLOY_SSH_KEY_{0}', env.SUFFIX)] }}
+          SSH_KNOWN_HOSTS: ${{ secrets[format('SSH_KNOWN_HOSTS_{0}', env.SUFFIX)] }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          if [ -n "$SSH_KNOWN_HOSTS" ]; then
+            printf '%s\n' "$SSH_KNOWN_HOSTS" >> ~/.ssh/known_hosts
+          else
+            ssh-keyscan -H "$SSH_HOST" >> ~/.ssh/known_hosts
+          fi
+
+      - name: Apply manifests
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST || vars.SSH_HOST }}
+          DEPLOY_USER: ${{ secrets[format('DEPLOY_USER_{0}', env.SUFFIX)] || vars[format('DEPLOY_USER_{0}', env.SUFFIX)] }}
+          IMAGE_REF: ${{ secrets.REGISTRY_HOST || vars.REGISTRY_HOST }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          APP_HOST: ${{ vars[format('APP_HOST_{0}', env.SUFFIX)] || secrets[format('APP_HOST_{0}', env.SUFFIX)] }}
+          SSL_REDIRECT: ${{ vars[format('SSL_REDIRECT_{0}', env.SUFFIX)] || 'false' }}
+          REPLICAS: ${{ vars[format('REPLICAS_{0}', env.SUFFIX)] || '1' }}
+        run: |
+          WWW_HOST="www.${APP_HOST}" \
+          envsubst '${IMAGE_REF} ${APP_HOST} ${WWW_HOST} ${SSL_REDIRECT} ${APP_PORT} ${REPLICAS} ${NAMESPACE}' < k8s/app.yml \
+            | ssh "$DEPLOY_USER@$SSH_HOST" \
+                'KUBECONFIG=$HOME/.kube/config kubectl apply -f -'
+
+      - name: Wait for rollout
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST || vars.SSH_HOST }}
+          DEPLOY_USER: ${{ secrets[format('DEPLOY_USER_{0}', env.SUFFIX)] || vars[format('DEPLOY_USER_{0}', env.SUFFIX)] }}
+        run: |
+          ssh "$DEPLOY_USER@$SSH_HOST" \
+            'KUBECONFIG=$HOME/.kube/config kubectl rollout status deployment/houston-web -n ${{ env.NAMESPACE }} --timeout=180s'
+
+      - name: Show cluster state on failure
+        if: failure()
+        env:
+          SSH_HOST: ${{ secrets.SSH_HOST || vars.SSH_HOST }}
+          DEPLOY_USER: ${{ secrets[format('DEPLOY_USER_{0}', env.SUFFIX)] || vars[format('DEPLOY_USER_{0}', env.SUFFIX)] }}
+        run: |
+          ssh "$DEPLOY_USER@$SSH_HOST" \
+            'export KUBECONFIG=$HOME/.kube/config; kubectl get pods,svc,ingress,certificate,pvc,cronjob -n ${{ env.NAMESPACE }}; kubectl describe pods -n ${{ env.NAMESPACE }} | tail -80; kubectl get events -n ${{ env.NAMESPACE }} --sort-by=.lastTimestamp | tail -20'
